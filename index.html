@@ -44,277 +44,531 @@
                 </div>
                 <iframe id="dynamicIframe" src="" width="100%" height="100%" frameborder="0"></iframe>
                 <script>
-                    // 接口根地址，换环境只改这里
+                    // 接口根地址，换环境只改这里。支付与 OAuth 的回程上下文只保存在本标签页。
                     const apiBase = 'https://javaapi.tthaol.com';
-                    // 获取当前域名和参数
-                    const currentDomain = window.location.origin;
-                    const currentSearch = window.location.search;
-                    console.log(`当前域名: ${currentDomain}`);
-                    console.log(`当前参数: ${currentSearch}`);
-
-                    // 解析 URL 参数，提取 token、访问标识、微信授权码与 state
-                    function getUrlParams() {
-                        const params = new URLSearchParams(currentSearch);
-                        return {
-                            t: params.get('t') || '',
-                            v: params.get('v') || '',
-                            accessToken: params.get('accessToken') || '',
-                            refreshToken: params.get('refreshToken') || ''
-                        };
-                    }
-
-                    const urlParams = getUrlParams();
-                    console.log(`解析到的参数: t=${urlParams.t}`);
-
-                    // 微信浏览器检测
-                    const isWeChatBrowser = /MicroMessenger/i.test(navigator.userAgent);
-                    // 渠道类型：微信内核浏览器 wechat_h5，否则 h5
-                    const channelType = isWeChatBrowser ? 'wechat_h5' : 'h5';
-                    // 授权失败回壳子页时带 oauthFailed=1，按游客继续落地校验，避免没有 token 再次拉起授权
-                    const oauthFailed = new URLSearchParams(currentSearch).get('oauthFailed') === '1';
-
-                    // 当前壳子页地址（去掉 token / 授权码），授权结束后回到本页，地址栏不进入平台 H5
-                    function buildShellReturnUrl() {
-                        const params = new URLSearchParams(currentSearch);
-                        params.delete('accessToken');
-                        params.delete('refreshToken');
-                        params.delete('code');
-                        params.delete('state');
-                        params.delete('oauthFailed');
-                        const qs = params.toString();
-                        return currentDomain + window.location.pathname + (qs ? '?' + qs : '');
-                    }
-
-                    // 获取 iframe 元素
+                    const OPERATION_PREFIX = 'tthl_shell_operation:';
+                    const OPERATION_TTL = 30 * 60 * 1000;
+                    const PAYMENT_RETURN_TTL = 24 * 60 * 60 * 1000;
+                    const PAYMENT_RECOVERY_TTL = 7 * 24 * 60 * 60 * 1000;
+                    const PAY_RETURN_PATH = '/pagesCommon/pages/payReturn/payReturn';
+                    const LOGIN_PATH = '/pages/login/login';
+                    const SCENES = ['wechatLogin', 'wechatBind', 'payment'];
+                    const CALLBACK_KEYS = ['shellBridgeId', 'shellBridge', 'ticket', 'lt', 'loginError', 'bindResult', 'bindReason', 'payOrderId', 'payOrderNo', 'businessPath', 'tenantId'];
+                    const AUTH_KEYS = ['token', 'accessToken', 'refreshToken', 'code', 'state', 'oauthFailed', 'ticket', 'lt', 'loginError', 'bindResult', 'bindReason'];
+                    const BRIDGE_KEYS = ['shellReturnUrl', 'shellResume', 'shellBridgeId', 'shellBridge', 'shellLoginReturnPath'];
                     const iframe = document.getElementById('dynamicIframe');
                     const loading = document.getElementById('loading');
-
-                    // 平台 H5 的源站。只接受这个源站的 postMessage，避免其它页面驱动壳子跳转
+                    const isWeChatBrowser = /MicroMessenger/i.test(navigator.userAgent);
+                    const channelType = isWeChatBrowser ? 'wechat_h5' : 'h5';
+                    const initialUrl = new URL(window.location.href);
+                    const initialParams = initialUrl.searchParams;
+                    let accessToken = initialParams.get('accessToken') || '';
+                    let refreshToken = initialParams.get('refreshToken') || '';
                     let allowedFrameOrigin = '';
-
-                    // 把壳子页判断出的渠道写进平台 hash。iframe 跨域读不到外层变量，平台从启动参数取 channelType
-                    function withChannelType(url) {
-                        const parsed = new URL(url, window.location.href);
-                        let hashPath = '/';
-                        let hashQuery = '';
-                        if (parsed.hash && parsed.hash.length > 1) {
-                            const raw = parsed.hash.slice(1);
-                            const qIdx = raw.indexOf('?');
-                            if (qIdx >= 0) {
-                                hashPath = raw.slice(0, qIdx) || '/';
-                                hashQuery = raw.slice(qIdx + 1);
-                            } else {
-                                hashPath = raw || '/';
-                            }
-                        }
-                        const params = new URLSearchParams(hashQuery);
-                        params.set('channelType', channelType);
-                        if (!hashPath.startsWith('/')) {
-                            hashPath = '/' + hashPath;
-                        }
-                        parsed.hash = hashPath + '?' + params.toString();
-                        return parsed.toString();
+                    let displayedUrl = '';
+                    let activeOperation = null;
+                    let initialFrameReady = false;
+                    
+                    function hashParts(url) {
+                    	const raw = url.hash.slice(1);
+                    	const index = raw.indexOf('?');
+                    	return { path: (index < 0 ? raw : raw.slice(0, index)) || '/', params: new URLSearchParams(index < 0 ? '' : raw.slice(index + 1)) };
                     }
-
-                    // 显示 iframe 并隐藏 loading（地址栏保持壳子域名，平台 H5 只在 iframe 内打开）
-                    function showIframe(url) {
-                        const target = withChannelType(url);
-                        console.log(`iframe 加载页面: ${target}`);
-                        allowedFrameOrigin = new URL(target, window.location.href).origin;
-                        iframe.src = target;
-                        iframe.classList.add('active');
-                        loading.style.display = 'none';
+                    
+                    function setHash(url, path, params) {
+                    	url.hash = `${path}${params.toString() ? '?' + params.toString() : ''}`;
+                    	return url;
                     }
-
-                    /**
-                     * 拼平台跳转地址：参数写入 hash（/#/?...），对齐 uni-app H5 启动解析；
-                     * 补登录态；失效域名场景附带新分享链供平台展示。
-                     *
-                     * @param {string} link 落地校验返回的平台链接
-                     * @param {{fromInvalidDomain?: boolean, redirectLink?: string, tenantId?: number|string}} extra 附加参数
-                     * @returns {string} 最终跳转 URL
-                     */
+                    
+                    function secureUrl(value) {
+                    	const url = new URL(value);
+                    	if (url.protocol !== 'https:' || url.username || url.password) throw new Error('跳转地址不合法');
+                    	return url;
+                    }
+                    
+                    function buildShellReturnUrl() {
+                    	const url = new URL(initialUrl.href);
+                    	[...AUTH_KEYS, ...BRIDGE_KEYS, 'payOrderId', 'payOrderNo', 'businessPath', 'tenantId'].forEach((key) => url.searchParams.delete(key));
+                    	url.hash = '';
+                    	return url.href;
+                    }
+                    
+                    const shellReturnUrl = buildShellReturnUrl();
+                    const LAST_URL_KEY = 'tthl_shell_last_url:' + shellReturnUrl;
+                    
+                    function operationFrontUrl(id) {
+                    	const url = secureUrl(shellReturnUrl);
+                    	return setHash(url, '/', new URLSearchParams({ shellBridgeId: id })).href;
+                    }
+                    
+                    function cleanPlatformUrl(value) {
+                    	const url = secureUrl(value);
+                    	const hash = hashParts(url);
+                    	if (!hash.path.startsWith('/') || hash.path.startsWith('//')) throw new Error('平台回程路由不合法');
+                    	['t', 'v', ...AUTH_KEYS, ...BRIDGE_KEYS].forEach((key) => {
+                    		url.searchParams.delete(key);
+                    		hash.params.delete(key);
+                    	});
+                    	return setHash(url, hash.path, hash.params);
+                    }
+                    
+                    function operationLifetime(record) {
+                    	if (record.recoveryOnly === true) return PAYMENT_RECOVERY_TTL;
+                    	return record.scene === 'payment' && Number.isFinite(record.departedAt) && record.departedAt >= record.createdAt && record.departedAt <= Date.now() + 60000
+                    		? PAYMENT_RETURN_TTL
+                    		: OPERATION_TTL;
+                    }
+                    
+                    function paymentRecoveryRecord(record) {
+                    	const url = secureUrl(record.returnUrl);
+                    	url.search = '';
+                    	const tenantId = /^[1-9]\d*$/.test(record.tenantId || '') ? String(record.tenantId) : '';
+                    	const returnUrl = setHash(url, '/pagesUser/pages/purchaseRecord/purchaseRecord', new URLSearchParams(tenantId ? { tenantId } : {})).href;
+                    	return { id: record.id, scene: 'payment', shellUrl: record.shellUrl, returnUrl, tenantId, createdAt: record.createdAt, recoveryOnly: true };
+                    }
+                    
+                    function recoveryError(record) {
+                    	const error = new Error('支付回程记录已过期，请查看原订单核实付款结果，勿重复下单');
+                    	error.recoveryUrl = paymentRecoveryRecord(record).returnUrl;
+                    	return error;
+                    }
+                    
+                    function readOperation(id, forDeparture = false) {
+                    	if (!/^[a-f0-9]{32}$/.test(id || '')) throw new Error('回程标识无效，请返回原页面重试');
+                    	const text = sessionStorage.getItem(OPERATION_PREFIX + id);
+                    	const record = text && JSON.parse(text);
+                    	if (!record || record.id !== id || !SCENES.includes(record.scene) || record.shellUrl !== shellReturnUrl) throw new Error('回程记录已丢失，请在原标签页重新操作');
+                    	secureUrl(record.returnUrl);
+                    	if (!Number.isFinite(record.createdAt) || record.createdAt > Date.now() + 60000 || Date.now() - record.createdAt > operationLifetime(record)) {
+                    		if (record.scene === 'payment' && Number.isFinite(record.createdAt) && record.createdAt <= Date.now() && Date.now() - record.createdAt <= PAYMENT_RECOVERY_TTL) {
+                    			// 清掉订单回调与支付能力，仅保留有固定期限的原站点订单列表入口。
+                    			try {
+                    				saveOperation(paymentRecoveryRecord(record));
+                    			} catch (e) {
+                    				sessionStorage.removeItem(OPERATION_PREFIX + id);
+                    			}
+                    			throw recoveryError(record);
+                    		}
+                    		sessionStorage.removeItem(OPERATION_PREFIX + id);
+                    		throw record.scene === 'payment' ? recoveryError(record) : new Error('操作已超时，请返回原页面重试');
+                    	}
+                    	if (record.recoveryOnly === true) throw recoveryError(record);
+                    	if (forDeparture && Date.now() - record.createdAt > OPERATION_TTL) throw new Error('支付准备已超时，请回原订单核实结果，不能再次拉起本次支付');
+                    	return record;
+                    }
+                    
+                    function saveOperation(record) {
+                    	const key = OPERATION_PREFIX + record.id;
+                    	const value = JSON.stringify(record);
+                    	sessionStorage.setItem(key, value);
+                    	if (sessionStorage.getItem(key) !== value) throw new Error('浏览器无法保存回程信息，请允许网站存储后重试');
+                    }
+                    
+                    function pruneExpiredOperations(currentId = '') {
+                    	// 只清本协议产生的过期记录，不影响站点的其它 sessionStorage 数据。
+                    	try {
+                    		const staleKeys = [];
+                    		const recoveryRecords = [];
+                    		for (let index = 0; index < sessionStorage.length; index++) {
+                    			const key = sessionStorage.key(index);
+                    			if (!key || !key.startsWith(OPERATION_PREFIX) || key === OPERATION_PREFIX + currentId) continue;
+                    			try {
+                    				const record = JSON.parse(sessionStorage.getItem(key));
+                    				if (!record || !Number.isFinite(record.createdAt) || record.createdAt > Date.now() + 60000 || Date.now() - record.createdAt > operationLifetime(record)) {
+                    					if (
+                    						record &&
+                    						key === OPERATION_PREFIX + record.id &&
+                    						record.scene === 'payment' &&
+                    						Number.isFinite(record.createdAt) &&
+                    						record.createdAt <= Date.now() &&
+                    						Date.now() - record.createdAt <= PAYMENT_RECOVERY_TTL
+                    					)
+                    						recoveryRecords.push(paymentRecoveryRecord(record));
+                    					else staleKeys.push(key);
+                    				}
+                    			} catch (e) {
+                    				staleKeys.push(key);
+                    			}
+                    		}
+                    		staleKeys.forEach((key) => sessionStorage.removeItem(key));
+                    		recoveryRecords.forEach((record) => {
+                    			try {
+                    				saveOperation(record);
+                    			} catch (e) {
+                    				sessionStorage.removeItem(OPERATION_PREFIX + record.id);
+                    			}
+                    		});
+                    	} catch (e) {
+                    		// 初次游客落地仍可继续；业务准备时会单独验证存储可用性。
+                    	}
+                    }
+                    
+                    function showError(message, recoveryUrl = '') {
+                    	loading.style.display = 'block';
+                    	loading.textContent = message || '加载失败，请稍后重试';
+                    	let retry = document.getElementById('shellRetry');
+                    	if (!retry) {
+                    		retry = document.createElement('button');
+                    		retry.id = 'shellRetry';
+                    		retry.textContent = '重试';
+                    		retry.addEventListener('click', () => window.location.reload());
+                    		loading.appendChild(retry);
+                    	}
+                    	if (recoveryUrl) {
+                    		const recovery = document.createElement('button');
+                    		recovery.id = 'shellRecovery';
+                    		recovery.textContent = '查看原订单';
+                    		recovery.addEventListener('click', () => {
+                    			activeOperation = null;
+                    			accessToken = '';
+                    			refreshToken = '';
+                    			landVerify(recoveryUrl);
+                    		});
+                    		loading.appendChild(recovery);
+                    	}
+                    }
+                    
+                    function injectBridge(value, operation) {
+                    	const url = secureUrl(value);
+                    	const hash = hashParts(url);
+                    	hash.params.set('channelType', channelType);
+                    	hash.params.set('shellReturnUrl', shellReturnUrl);
+                    	if (operation) {
+                    		hash.params.set('shellResume', '1');
+                    		hash.params.set('shellBridgeId', operation.id);
+                    	}
+                    	return setHash(url, hash.path, hash.params).href;
+                    }
+                    
+                    function showIframe(value, operation) {
+                    	const url = secureUrl(value);
+                    	if (allowedFrameOrigin && url.origin !== allowedFrameOrigin) throw new Error('平台域名与原操作不一致');
+                    	allowedFrameOrigin = url.origin;
+                    	displayedUrl = injectBridge(url.href, operation);
+                    	iframe.src = displayedUrl;
+                    	iframe.classList.add('active');
+                    	loading.style.display = 'none';
+                    }
+                    
+                    // 回调可在 search 或 hash；重复值必须一致，防止一处验证另一处执行。
+                    function readCallback() {
+                    	const hash = hashParts(initialUrl).params;
+                    	const result = {};
+                    	CALLBACK_KEYS.forEach((key) => {
+                    		const values = [...initialParams.getAll(key), ...hash.getAll(key)];
+                    		if (new Set(values).size > 1) throw new Error('回程参数冲突，请返回原页面重试');
+                    		if (values.length) result[key] = values[0];
+                    	});
+                    	return result;
+                    }
+                    
+                    function captureCallback(params) {
+                    	const record = readOperation(params.shellBridgeId);
+                    	const isCallback = ['ticket', 'lt', 'loginError', 'bindResult', 'bindReason', 'shellBridge'].some((key) => Object.prototype.hasOwnProperty.call(params, key));
+                    	if (!isCallback) {
+                    		if (!record.callback && !record.resumeUrl) throw new Error('未收到完整回程结果，请返回原页面重试');
+                    		return record;
+                    	}
+                    	const callback = {};
+                    	if (record.scene === 'payment') {
+                    		if (params.shellBridge !== 'payment' || params.payOrderId !== record.payOrderId || params.tenantId !== record.tenantId || params.businessPath !== record.businessPath)
+                    			throw new Error('支付回程与原订单不一致，请返回原订单核实');
+                    		if (params.ticket || params.lt || params.loginError || params.bindResult) throw new Error('支付回程参数不合法');
+                    		if (params.payOrderNo && !/^[a-zA-Z0-9_-]{1,128}$/.test(params.payOrderNo)) throw new Error('支付查单号无效');
+                    		Object.assign(callback, { payOrderId: record.payOrderId, tenantId: record.tenantId, businessPath: record.businessPath, payOrderNo: params.payOrderNo || '' });
+                    	} else if (record.scene === 'wechatLogin') {
+                    		const ticket = params.ticket || params.lt;
+                    		if (params.shellBridge || params.bindResult || (ticket && params.loginError) || (params.ticket && params.lt && params.ticket !== params.lt))
+                    			throw new Error('登录回程参数不合法');
+                    		if (ticket) {
+                    			if (!/^[a-zA-Z0-9_-]{1,512}$/.test(ticket)) throw new Error('登录凭证无效，请重新授权');
+                    			callback.ticket = ticket;
+                    		} else if (params.loginError) {
+                    			callback.loginError = params.loginError;
+                    		} else throw new Error('未收到登录结果，请重新授权');
+                    	} else {
+                    		if (params.shellBridge || params.ticket || params.lt || params.loginError || !['ok', 'fail'].includes(params.bindResult)) throw new Error('绑定回程参数不合法');
+                    		callback.bindResult = params.bindResult;
+                    		if (params.bindReason) callback.bindReason = params.bindReason;
+                    	}
+                    	// 已确认消费的回调不得因用户后退而再次兑换一次性票据。
+                    	if (record.resumeUrl && !record.callback) return record;
+                    	if (record.callback && JSON.stringify(record.callback) !== JSON.stringify(callback)) throw new Error('回程结果与已保存结果冲突');
+                    	record.callback = callback;
+                    	saveOperation(record);
+                    	return record;
+                    }
+                    
+                    function buildResumeUrl(record) {
+                    	if (!record.callback && record.resumeUrl) {
+                    		const resumed = cleanPlatformUrl(record.resumeUrl);
+                    		const hash = hashParts(resumed);
+                    		if (record.scene === 'wechatLogin' && hash.path === LOGIN_PATH) {
+                    			hash.params.set('shellLoginReturnPath', cleanPlatformUrl(record.returnUrl).hash.slice(1));
+                    			setHash(resumed, hash.path, hash.params);
+                    		}
+                    		return resumed.href;
+                    	}
+                    	const url = cleanPlatformUrl(record.returnUrl);
+                    	let hash = hashParts(url);
+                    	if (record.scene === 'wechatLogin') {
+                    		const returnPath = url.hash.slice(1);
+                    		hash = { path: LOGIN_PATH, params: new URLSearchParams({ shellLoginReturnPath: returnPath }) };
+                    	} else if (record.scene === 'payment') {
+                    		hash.path = PAY_RETURN_PATH;
+                    	}
+                    	Object.entries(record.callback || {}).forEach(([key, value]) => {
+                    		if (value) hash.params.set(key, value);
+                    	});
+                    	return setHash(url, hash.path, hash.params).href;
+                    }
+                    
                     function buildPlatformJumpUrl(link, extra) {
-                        const url = new URL(link, window.location.href);
-                        // 1. 解析已有 hash query（#/?a=1 或 #/pages/x?a=1）；兼容旧版把参数放在 search 的链接
-                        let hashPath = '/';
-                        let hashQuery = '';
-                        if (url.hash && url.hash.length > 1) {
-                            const raw = url.hash.slice(1); // 去掉 #
-                            const qIdx = raw.indexOf('?');
-                            if (qIdx >= 0) {
-                                hashPath = raw.slice(0, qIdx) || '/';
-                                hashQuery = raw.slice(qIdx + 1);
-                            } else {
-                                hashPath = raw || '/';
-                            }
-                        }
-                        const params = new URLSearchParams(hashQuery);
-                        url.searchParams.forEach((value, key) => {
-                            if (!params.has(key)) {
-                                params.set(key, value);
-                            }
-                        });
-                        url.search = '';
-                        // 2. 补登录态。场景、模块、目标仍走 /context，不放进地址
-                        params.delete('sceneType');
-                        params.delete('moduleCode');
-                        params.delete('targetId');
-                        if (accessToken) {
-                            params.set('accessToken', accessToken);
-                        }
-                        if (refreshToken) {
-                            params.set('refreshToken', refreshToken);
-                        }
-                        // 平台启动时没有租户号会清掉刚写入的登录态。只带落地校验返回的租户号
-                        const tenantId = extra && extra.tenantId != null ? String(extra.tenantId).trim() : '';
-                        if (/^[1-9]\d*$/.test(tenantId)) {
-                            params.set('tenantId', tenantId);
-                        }
-                        if (extra && extra.fromInvalidDomain && extra.redirectLink) {
-                            params.set('fromInvalidDomain', '1');
-                            params.set('redirectLink', extra.redirectLink);
-                        }
-                        if (!hashPath.startsWith('/')) {
-                            hashPath = '/' + hashPath;
-                        }
-                        url.hash = hashPath + '?' + params.toString();
-                        return url.toString();
+                    	const url = secureUrl(link);
+                    	const hash = hashParts(url);
+                    	url.searchParams.forEach((value, key) => {
+                    		if (!hash.params.has(key)) hash.params.set(key, value);
+                    	});
+                    	url.search = '';
+                    	['sceneType', 'moduleCode', 'targetId', ...AUTH_KEYS, ...BRIDGE_KEYS].forEach((key) => hash.params.delete(key));
+                    	if (accessToken) hash.params.set('accessToken', accessToken);
+                    	if (refreshToken) hash.params.set('refreshToken', refreshToken);
+                    	const tenantId = extra.tenantId == null ? '' : String(extra.tenantId);
+                    	if (/^[1-9]\d*$/.test(tenantId)) hash.params.set('tenantId', tenantId);
+                    	if (extra.fromInvalidDomain && extra.redirectLink) {
+                    		hash.params.set('fromInvalidDomain', '1');
+                    		hash.params.set('redirectLink', extra.redirectLink);
+                    	}
+                    	return setHash(url, hash.path, hash.params).href;
                     }
-
-                    // 壳子页：调后端落地风控校验，通过后在 iframe 打开平台 H5，地址栏保持壳子域名
-                    const t = urlParams.t || '';
-                    const v = urlParams.v || '';
-                    const accessToken = urlParams.accessToken || '';
-                    const refreshToken = urlParams.refreshToken || '';
-                    let verifyUrl = `${apiBase}/app-api/site/share/land/verify`;
-
-                    console.log(`请求落地风控: ${verifyUrl}`);
-
-                    // 落地风控：通过后 iframe 打开平台。授权地址拿失败时也会走到这里，按游客继续
-                    function landVerify() {
-                        fetch(verifyUrl, {
-                            method: "POST",
-                            headers: {
-                                "Content-Type": "application/json",
-                                "Authorization": "Bearer " + accessToken,
-                                "channel-type": channelType,
-                            },
-                            body: JSON.stringify({ t: t, v: v }),
-                        })
-                            .then((response) => response.json())
-                            .then((res) => {
-                                console.log("落地风控返回:", res);
-                                // yudao CommonResult：code=0 成功
-                                if (res && res.code === 0 && res.data) {
-                                    const { pass, interceptUrl, fromInvalidDomain, redirectLink, link, tenantId } = res.data;
-                                    if (pass) {
-                                        if (!link) {
-                                            loading.textContent = "加载失败，请稍后再试。";
-                                            return;
-                                        }
-                                        // 放行：iframe 打开平台；失效域名把新分享链带给平台展示。地址栏仍是壳子域名
-                                        const target = buildPlatformJumpUrl(link, {
-                                            fromInvalidDomain: !!fromInvalidDomain,
-                                            redirectLink: redirectLink || '',
-                                            tenantId: tenantId,
-                                        });
-                                        console.log("iframe 打开平台 H5:", target);
-                                        showIframe(target);
-                                    } else if (interceptUrl) {
-                                        // 拦截：跳拦截博客地址
-                                        location.href = interceptUrl;
-                                    } else {
-                                        loading.textContent = "加载失败，请稍后再试。";
-                                    }
-                                } else {
-                                    loading.textContent = "加载失败，请稍后再试。";
-                                }
-                            })
-                            .catch((err) => {
-                                console.error("请求失败：", err);
-                                loading.textContent = "加载失败，请检查网络连接。";
-                            });
+                    
+                    function cleanOuterUrl(operation) {
+                    	const url = new URL(shellReturnUrl);
+                    	if (operation) setHash(url, '/', new URLSearchParams({ shellBridgeId: operation.id }));
+                    	window.history.replaceState(window.history.state, '', url.href);
                     }
-
-                    // 1. 微信且还没有登录态：先拿授权地址，成功则顶层去微信，回跳本页后再落地
-                    // 2. 授权地址失败：写出原因，按游客落地，避免停在「加载中」
-                    if (isWeChatBrowser && !accessToken && !oauthFailed) {
-                        const returnUrl = buildShellReturnUrl();
-                        fetch(`${apiBase}/app-api/site/share/oauth-jump?type=31&t=${encodeURIComponent(t)}&v=${encodeURIComponent(v)}&returnUrl=${encodeURIComponent(returnUrl)}`, {
-                            headers: {
-                                "channel-type": channelType,
-                            },
-                        })
-                            .then((response) => response.json())
-                            .then((res) => {
-                                if (res && res.code === 0 && res.data) {
-                                    console.log("跳转微信授权:", res.data);
-                                    location.href = res.data;
-                                    return;
-                                }
-                                const msg = (res && res.msg) ? res.msg : "获取微信授权地址失败";
-                                console.error("获取微信授权地址失败：", res);
-                                loading.textContent = msg;
-                                landVerify();
-                            })
-                            .catch((err) => {
-                                console.error("获取微信授权地址失败：", err);
-                                loading.textContent = "获取微信授权地址失败，请检查网络连接。";
-                                landVerify();
-                            });
-                    } else {
-                        landVerify();
+                    
+                    function rememberReadyUrl(value) {
+                    	const incoming = secureUrl(value);
+                    	const incomingHash = hashParts(incoming);
+                    	// 等平台完成分享分流后再记实际业务页，不能把初始 #/?t/v 变成首页覆盖。
+                    	if (incomingHash.path === '/' && ['t', 'v'].some((key) => incoming.searchParams.has(key) || incomingHash.params.has(key))) return '';
+                    	const url = cleanPlatformUrl(incoming.href);
+                    	if (url.origin !== allowedFrameOrigin) throw new Error('平台地址不一致');
+                    	sessionStorage.setItem(LAST_URL_KEY, JSON.stringify({ url: url.href, createdAt: Date.now() }));
+                    	return url.href;
                     }
-
-                    // 复制新分享链接
-                    document.getElementById('copyLink').addEventListener('click', function() {
-                        const link = document.getElementById('newLink').value;
-                        if (!link) return;
-                        if (navigator.clipboard) {
-                            navigator.clipboard.writeText(link).then(() => alert('已复制到剪贴板'));
-                        } else {
-                            const input = document.getElementById('newLink');
-                            input.select();
-                            document.execCommand('copy');
-                            alert('已复制到剪贴板');
-                        }
+                    
+                    function readLastUrl() {
+                    	try {
+                    		const record = JSON.parse(sessionStorage.getItem(LAST_URL_KEY) || 'null');
+                    		if (!record || !Number.isFinite(record.createdAt) || Date.now() - record.createdAt > OPERATION_TTL || record.createdAt > Date.now() + 60000) return '';
+                    		return cleanPlatformUrl(record.url).href;
+                    	} catch (e) {
+                    		return '';
+                    	}
+                    }
+                    
+                    function reply(event, ok, extra) {
+                    	event.source.postMessage({ action: 'shellReply', requestId: event.data.requestId || '', ok, ...extra }, event.origin);
+                    }
+                    
+                    function prepareOperation(data) {
+                    	pruneExpiredOperations();
+                    	if (!/^[a-f0-9]{32}$/.test(data.requestId || '') || !SCENES.includes(data.scene)) throw new Error('操作参数不合法');
+                    	const url = cleanPlatformUrl(data.returnUrl);
+                    	if (url.origin !== allowedFrameOrigin) throw new Error('回程平台域名不一致');
+                    	if (sessionStorage.getItem(OPERATION_PREFIX + data.requestId)) throw new Error('操作标识已使用，请重新发起');
+                    	const record = { id: data.requestId, scene: data.scene, returnUrl: url.href, shellUrl: shellReturnUrl, createdAt: Date.now() };
+                    	if (data.scene === 'payment') {
+                    		if (
+                    			!/^[1-9]\d*$/.test(data.payOrderId || '') ||
+                    			!/^[1-9]\d*$/.test(data.tenantId || '') ||
+                    			typeof data.businessPath !== 'string' ||
+                    			!data.businessPath.startsWith('/') ||
+                    			data.businessPath.startsWith('//')
+                    		)
+                    			throw new Error('支付订单上下文不完整');
+                    		const checkout = secureUrl(data.checkoutOrigin);
+                    		if (checkout.origin !== data.checkoutOrigin) throw new Error('支付项目域名不合法');
+                    		const hash = hashParts(url);
+                    		hash.params.set('payOrderId', String(data.payOrderId));
+                    		hash.params.set('tenantId', String(data.tenantId));
+                    		hash.params.set('businessPath', data.businessPath);
+                    		record.returnUrl = setHash(url, PAY_RETURN_PATH, hash.params).href;
+                    		Object.assign(record, { payOrderId: String(data.payOrderId), tenantId: String(data.tenantId), businessPath: data.businessPath, checkoutOrigin: checkout.origin });
+                    	}
+                    	saveOperation(record);
+                    	return record;
+                    }
+                    
+                    function validateTopRedirect(data) {
+                    	const record = readOperation(data.operationId, true);
+                    	if (record.scene !== data.scene) throw new Error('跳转场景不一致');
+                    	const target = secureUrl(data.url);
+                    	if (record.scene === 'payment') {
+                    		if (target.origin !== record.checkoutOrigin || target.search) throw new Error('支付项目地址与准备记录不一致');
+                    		const hash = hashParts(target);
+                    		if (hash.path !== '/pages/paymentProcess/paymentProcess' || hash.params.getAll('payload').length !== 1 || hash.params.getAll('handoffId').length !== 1)
+                    			throw new Error('支付交接格式不合法');
+                    		const payload = JSON.parse(hash.params.get('payload'));
+                    		if (
+                    			hash.params.get('handoffId') !== record.id ||
+                    			payload.handoffId !== record.id ||
+                    			String(payload.payOrderId) !== record.payOrderId ||
+                    			String(payload.tenantId) !== record.tenantId ||
+                    			payload.businessPath !== record.businessPath ||
+                    			payload.shellReturnUrl !== operationFrontUrl(record.id)
+                    		)
+                    			throw new Error('支付交接与原订单不一致');
+                    		const paymentReturn = cleanPlatformUrl(payload.returnUrl);
+                    		if (paymentReturn.origin !== new URL(record.returnUrl).origin || hashParts(paymentReturn).path !== PAY_RETURN_PATH) throw new Error('支付平台回程地址不一致');
+                    	} else {
+                    		if (target.hostname !== 'open.weixin.qq.com' || target.port || target.pathname !== '/connect/oauth2/authorize') throw new Error('只允许跳转微信网页授权');
+                    	}
+                    	record.departedAt = Date.now();
+                    	saveOperation(record);
+                    	return target.href;
+                    }
+                    
+                    window.addEventListener('message', (event) => {
+                    	if (!allowedFrameOrigin || event.origin !== allowedFrameOrigin || event.source !== iframe.contentWindow || !event.data || typeof event.data !== 'object') return;
+                    	const data = event.data;
+                    	try {
+                    		if (data.action === 'shellPrepare') {
+                    			const record = prepareOperation(data);
+                    			reply(event, true, { frontUrl: operationFrontUrl(record.id) });
+                    		} else if (data.action === 'topRedirect') {
+                    			const target = validateTopRedirect(data);
+                    			window.location.replace(target);
+                    			reply(event, true);
+                    		} else if (data.action === 'shellReady') {
+                    			if (!activeOperation) {
+                    				try {
+                    					rememberReadyUrl(data.currentUrl || displayedUrl);
+                    				} finally {
+                    					// 存储失败也清除地址栏凭证，不将旧 token 留在可复制链接中。
+                    					if (!initialFrameReady) {
+                    						cleanOuterUrl();
+                    						accessToken = '';
+                    						refreshToken = '';
+                    						initialFrameReady = true;
+                    					}
+                    				}
+                    			}
+                    			if (data.requestId) reply(event, true);
+                    		} else if (data.action === 'shellResumeConsumed') {
+                    			if (!activeOperation || data.operationId !== activeOperation.id) throw new Error('回程确认标识不一致');
+                    			const record = readOperation(activeOperation.id);
+                    			const clean = cleanPlatformUrl(data.currentUrl || buildResumeUrl(record));
+                    			if (clean.origin !== allowedFrameOrigin) throw new Error('回程确认地址不一致');
+                    			// 支付始终保留原单查单参数；登录按处理完毕后的实际路由恢复。
+                    			record.resumeUrl = record.scene === 'payment' ? cleanPlatformUrl(buildResumeUrl(record)).href : clean.href;
+                    			delete record.callback;
+                    			saveOperation(record);
+                    			activeOperation = record;
+                    			rememberReadyUrl(record.resumeUrl);
+                    			cleanOuterUrl(record);
+                    			if (data.requestId) reply(event, true);
+                    		} else if (data.action === 'redirect') {
+                    			const target = secureUrl(data.url);
+                    			if (target.origin !== allowedFrameOrigin) throw new Error('不允许 iframe 跳往外部域名');
+                    			showIframe(target.href, activeOperation);
+                    		} else if (data.action === 'wechatOAuth') {
+                    			throw new Error('请更新平台页面，通过回程准备协议发起微信授权');
+                    		}
+                    	} catch (e) {
+                    		reply(event, false, { error: e.message || '壳子操作失败，请稍后重试' });
+                    	}
                     });
-
-                    // 监听 postMessage：iframe 内换页仍留在 iframe；微信授权必须交给顶层窗口，否则微信提示「请在微信客户端打开链接」
-                    window.addEventListener("message", function(event) {
-                        if (!allowedFrameOrigin || event.origin !== allowedFrameOrigin) {
-                            return;
-                        }
-                        if (!event.data || !event.data.url) {
-                            return;
-                        }
-                        if (event.data.action === "redirect") {
-                            console.log(`收到 postMessage 跳转指令，iframe 加载: ${event.data.url}`);
-                            showIframe(event.data.url);
-                            return;
-                        }
-                        if (event.data.action === "wechatOAuth") {
-                            // 分享链路已把 accessToken 带回壳子。再把顶层窗口送去授权，回来会落在平台登录页，分享页进不去
-                            if (accessToken) {
-                                console.log("壳子已有登录态，忽略微信授权跳转");
-                                return;
-                            }
-                            let oauthUrl;
-                            try {
-                                oauthUrl = new URL(event.data.url);
-                            } catch (e) {
-                                return;
-                            }
-                            // 只放行微信网页授权，避免平台页把顶层窗口带到其它地址
-                            if (oauthUrl.protocol !== 'https:' || oauthUrl.hostname !== 'open.weixin.qq.com') {
-                                return;
-                            }
-                            console.log('顶层窗口打开微信授权:', oauthUrl.toString());
-                            location.href = oauthUrl.toString();
-                        }
+                    
+                    async function landVerify(resumeUrl) {
+                    	try {
+                    		const headers = { 'Content-Type': 'application/json', 'channel-type': channelType };
+                    		if (accessToken && !activeOperation) headers.Authorization = 'Bearer ' + accessToken;
+                    		const response = await fetch(`${apiBase}/app-api/site/share/land/verify`, {
+                    			method: 'POST',
+                    			headers,
+                    			body: JSON.stringify({ t: initialParams.get('t') || '', v: initialParams.get('v') || '' })
+                    		});
+                    		const res = await response.json();
+                    		if (!res || res.code !== 0 || !res.data) throw new Error('落地校验失败，请稍后重试');
+                    		const { pass, interceptUrl, link, tenantId, fromInvalidDomain, redirectLink } = res.data;
+                    		if (!pass) {
+                    			if (activeOperation) throw new Error('回程落地校验未通过，请稍后重试，勿重复付款');
+                    			if (interceptUrl) window.location.replace(secureUrl(interceptUrl).href);
+                    			else throw new Error('落地校验未通过，请稍后重试');
+                    			return;
+                    		}
+                    		const verified = secureUrl(link);
+                    		if (resumeUrl) {
+                    			if (secureUrl(resumeUrl).origin !== verified.origin) throw new Error('原操作平台与当前落地平台不一致，请返回原页面重试');
+                    			showIframe(resumeUrl, activeOperation);
+                    		} else showIframe(buildPlatformJumpUrl(verified.href, { tenantId, fromInvalidDomain, redirectLink }), null);
+                    	} catch (e) {
+                    		showError(e.message);
+                    	}
+                    }
+                    
+                    async function start() {
+                    	try {
+                    		const params = readCallback();
+                    		pruneExpiredOperations(params.shellBridgeId);
+                    		const callbackSeen = ['shellBridgeId', 'shellBridge', 'ticket', 'lt', 'loginError', 'bindResult', 'bindReason'].some((key) =>
+                    			Object.prototype.hasOwnProperty.call(params, key)
+                    		);
+                    		if (callbackSeen) {
+                    			activeOperation = captureCallback(params);
+                    			// 回程不得复用初次分享登录的旧凭证。
+                    			accessToken = '';
+                    			refreshToken = '';
+                    			await landVerify(buildResumeUrl(activeOperation));
+                    			return;
+                    		}
+                    		const lastUrl = readLastUrl();
+                    		if (lastUrl && !accessToken) {
+                    			await landVerify(lastUrl);
+                    			return;
+                    		}
+                    		if (isWeChatBrowser && !accessToken && initialParams.get('oauthFailed') !== '1') {
+                    			try {
+                    				const response = await fetch(
+                    					`${apiBase}/app-api/site/share/oauth-jump?type=31&t=${encodeURIComponent(initialParams.get('t') || '')}&v=${encodeURIComponent(initialParams.get('v') || '')}&returnUrl=${encodeURIComponent(shellReturnUrl)}`,
+                    					{ headers: { 'channel-type': channelType } }
+                    				);
+                    				const res = await response.json();
+                    				if (res && res.code === 0 && res.data) {
+                    					const target = secureUrl(res.data);
+                    					if (target.hostname !== 'open.weixin.qq.com' || target.pathname !== '/connect/oauth2/authorize') throw new Error('微信授权地址不合法');
+                    					window.location.replace(target.href);
+                    					return;
+                    				}
+                    			} catch (e) {
+                    				// 初次分享授权获取失败仍沿用游客落地；业务回程不会走此分支。
+                    			}
+                    		}
+                    		await landVerify();
+                    	} catch (e) {
+                    		showError(e.message || '回程加载失败，请返回原页面重试', e.recoveryUrl || '');
+                    	}
+                    }
+                    
+                    document.getElementById('copyLink').addEventListener('click', () => {
+                    	const input = document.getElementById('newLink');
+                    	if (!input.value) return;
+                    	if (navigator.clipboard)
+                    		navigator.clipboard
+                    			.writeText(input.value)
+                    			.then(() => alert('已复制到剪贴板'))
+                    			.catch(() => alert('复制失败，请长按链接复制'));
+                    	else {
+                    		input.select();
+                    		document.execCommand('copy');
+                    		alert('已复制到剪贴板');
+                    	}
                     });
-
+                    
+                    start();
                 </script>
             </body>
         </html>
