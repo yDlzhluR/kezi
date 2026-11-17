@@ -5,14 +5,6 @@
             <head>
                 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
                 <title>天天好料</title>
-                <script src="https://res.wx.qq.com/open/js/jweixin-1.6.0.js"></script>
-        		<script>
-        			if (typeof wx !== 'undefined') {
-        				window.wxjs = wx;
-        			} else {
-        				console.error('微信 JS-SDK 加载失败，wx 未定义');
-        			}
-        		</script>
             </head>
             <style>
                 *{
@@ -112,62 +104,6 @@
                             })
                             .catch((err) => {
                                 console.error("获取微信授权地址失败：", err);
-                            });
-                    }
-
-                    if (isWeChatBrowser && !oauthRedirecting) {
-                        console.log("微信浏览器检测通过，开始屏蔽功能");
-
-                        // 调用微信 JS-SDK 接口
-                        fetch(`${apiBase}/api/wechat/getJsapiTicket`, {
-                            method: "POST",
-                            headers: {
-                                "Content-Type": "application/json",
-                            },
-                            body: JSON.stringify({
-                                url: currentDomain,
-                            }),
-                        })
-                            .then((response) => response.json())
-                            .then((res) => {
-                                if (res && res.data) {
-                                    console.log("微信 JS-SDK 初始化中...");
-                                    window.wxjs.config({
-                                        debug: false,
-                                        appId: res.data.appId,
-                                        timestamp: res.data.timestamp,
-                                        nonceStr: res.data.nonceStr,
-                                        signature: res.data.signature,
-                                        jsApiList: [
-                                            "hideOptionMenu",
-                                            "hideMenuItems",
-                                            "closeWindow",
-                                        ],
-                                    });
-
-                                    window.wxjs.ready(() => {
-                                        console.log("微信 JS-SDK 初始化成功，开始屏蔽分享功能");
-                                        window.wxjs.hideOptionMenu();
-                                        window.wxjs.hideMenuItems({
-                                            menuList: [
-                                                "menuItem:share:appMessage",
-                                                "menuItem:share:timeline",
-                                                "menuItem:copyUrl",
-                                                "menuItem:openWithQQBrowser",
-                                                "menuItem:openWithSafari",
-                                            ],
-                                        });
-                                    });
-
-                                    window.wxjs.error((err) => {
-                                        console.error("微信 JS-SDK 初始化失败：", err);
-                                    });
-                                } else {
-                                    console.error("微信接口返回数据格式不正确");
-                                }
-                            })
-                            .catch((err) => {
-                                console.error("获取微信 JS-SDK 配置失败：", err);
                             });
                     }
 
