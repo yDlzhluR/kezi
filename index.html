@@ -52,6 +52,8 @@
                 </div>
                 <iframe id="dynamicIframe" src="" width="100%" height="100%" frameborder="0"></iframe>
                 <script>
+                    // 接口根地址，换环境只改这里
+                    const apiBase = 'https://javaapi.tthaol.com';
                     // 获取当前域名和参数
                     const currentDomain = window.location.origin;
                     const currentSearch = window.location.search;
@@ -76,12 +78,27 @@
                     const isWeChatBrowser = /MicroMessenger/i.test(navigator.userAgent);
                     // 渠道类型：微信内核浏览器 wechat_h5，否则 h5
                     const channelType = isWeChatBrowser ? 'wechat_h5' : 'h5';
+                    // 授权失败回壳子页时带 oauthFailed=1，按游客继续落地校验，避免没有 token 再次拉起授权
+                    const oauthFailed = new URLSearchParams(currentSearch).get('oauthFailed') === '1';
 
-                    // 微信 H5 授权：无 accessToken 时先走 oauth-jump 一次直达微信授权，回跳后带上 accessToken 再继续
+                    // 当前壳子页地址（去掉 token / 授权码），授权结束后回到本页，地址栏不进入平台 H5
+                    function buildShellReturnUrl() {
+                        const params = new URLSearchParams(currentSearch);
+                        params.delete('accessToken');
+                        params.delete('refreshToken');
+                        params.delete('code');
+                        params.delete('state');
+                        params.delete('oauthFailed');
+                        const qs = params.toString();
+                        return currentDomain + window.location.pathname + (qs ? '?' + qs : '');
+                    }
+
+                    // 微信 H5 授权：无 accessToken 时先走 oauth-jump 一次直达微信授权，回跳本页带上 accessToken 再继续
                     let oauthRedirecting = false;
-                    if (isWeChatBrowser && !urlParams.accessToken) {
+                    if (isWeChatBrowser && !urlParams.accessToken && !oauthFailed) {
                         oauthRedirecting = true;
-                        fetch(`https://javaapi.tthaol.com/app-api/site/share/oauth-jump?type=31&t=${encodeURIComponent(urlParams.t)}&v=${encodeURIComponent(urlParams.v)}`, {
+                        const returnUrl = buildShellReturnUrl();
+                        fetch(`${apiBase}/app-api/site/share/oauth-jump?type=31&t=${encodeURIComponent(urlParams.t)}&v=${encodeURIComponent(urlParams.v)}&returnUrl=${encodeURIComponent(returnUrl)}`, {
                             headers: {
                                 "channel-type": channelType,
                             },
@@ -102,7 +119,7 @@
                         console.log("微信浏览器检测通过，开始屏蔽功能");
 
                         // 调用微信 JS-SDK 接口
-                        fetch(`https://javaapi.tthaol.com/api/wechat/getJsapiTicket`, {
+                        fetch(`${apiBase}/api/wechat/getJsapiTicket`, {
                             method: "POST",
                             headers: {
                                 "Content-Type": "application/json",
@@ -158,10 +175,39 @@
                     const iframe = document.getElementById('dynamicIframe');
                     const loading = document.getElementById('loading');
 
-                    // 显示 iframe 并隐藏 loading（供 iframe 内 postMessage 跳转使用）
+                    // 平台 H5 的源站。只接受这个源站的 postMessage，避免其它页面驱动壳子跳转
+                    let allowedFrameOrigin = '';
+
+                    // 把壳子页判断出的渠道写进平台 hash。iframe 跨域读不到外层变量，平台从启动参数取 channelType
+                    function withChannelType(url) {
+                        const parsed = new URL(url, window.location.href);
+                        let hashPath = '/';
+                        let hashQuery = '';
+                        if (parsed.hash && parsed.hash.length > 1) {
+                            const raw = parsed.hash.slice(1);
+                            const qIdx = raw.indexOf('?');
+                            if (qIdx >= 0) {
+                                hashPath = raw.slice(0, qIdx) || '/';
+                                hashQuery = raw.slice(qIdx + 1);
+                            } else {
+                                hashPath = raw || '/';
+                            }
+                        }
+                        const params = new URLSearchParams(hashQuery);
+                        params.set('channelType', channelType);
+                        if (!hashPath.startsWith('/')) {
+                            hashPath = '/' + hashPath;
+                        }
+                        parsed.hash = hashPath + '?' + params.toString();
+                        return parsed.toString();
+                    }
+
+                    // 显示 iframe 并隐藏 loading（地址栏保持壳子域名，平台 H5 只在 iframe 内打开）
                     function showIframe(url) {
-                        console.log(`iframe 加载页面: ${url}`);
-                        iframe.src = url;
+                        const target = withChannelType(url);
+                        console.log(`iframe 加载页面: ${target}`);
+                        allowedFrameOrigin = new URL(target, window.location.href).origin;
+                        iframe.src = target;
                         iframe.classList.add('active');
                         loading.style.display = 'none';
                     }
@@ -214,12 +260,12 @@
                         return url.toString();
                     }
 
-                    // 壳子页：调后端落地风控校验，通过后整页跳平台 H5
+                    // 壳子页：调后端落地风控校验，通过后在 iframe 打开平台 H5，地址栏保持壳子域名
                     const t = urlParams.t || '';
                     const v = urlParams.v || '';
                     const accessToken = urlParams.accessToken || '';
                     const refreshToken = urlParams.refreshToken || '';
-                    let verifyUrl = `https://javaapi.tthaol.com/app-api/site/share/land/verify`;
+                    let verifyUrl = `${apiBase}/app-api/site/share/land/verify`;
 
                     console.log(`请求落地风控: ${verifyUrl}`);
 
@@ -245,13 +291,13 @@
                                             loading.textContent = "加载失败，请稍后再试。";
                                             return;
                                         }
-                                        // 放行：整页跳平台；失效域名把新分享链带给平台展示
+                                        // 放行：iframe 打开平台；失效域名把新分享链带给平台展示。地址栏仍是壳子域名
                                         const target = buildPlatformJumpUrl(link, {
                                             fromInvalidDomain: !!fromInvalidDomain,
                                             redirectLink: redirectLink || '',
                                         });
-                                        console.log("跳转平台 H5:", target);
-                                        location.href = target;
+                                        console.log("iframe 打开平台 H5:", target);
+                                        showIframe(target);
                                     } else if (interceptUrl) {
                                         // 拦截：跳拦截博客地址
                                         location.href = interceptUrl;
@@ -284,6 +330,9 @@
 
                     // 监听 postMessage 消息，用于 iframe 内部通知外层跳转
                     window.addEventListener("message", function(event) {
+                        if (!allowedFrameOrigin || event.origin !== allowedFrameOrigin) {
+                            return;
+                        }
                         if (event.data && event.data.action === "redirect") {
                             console.log(`收到 postMessage 跳转指令，iframe 加载: ${event.data.url}`);
                             // 使用 iframe 加载新页面
