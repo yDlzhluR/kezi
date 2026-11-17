@@ -264,15 +264,32 @@
                         }
                     });
 
-                    // 监听 postMessage 消息，用于 iframe 内部通知外层跳转
+                    // 监听 postMessage：iframe 内换页仍留在 iframe；微信授权必须交给顶层窗口，否则微信提示「请在微信客户端打开链接」
                     window.addEventListener("message", function(event) {
                         if (!allowedFrameOrigin || event.origin !== allowedFrameOrigin) {
                             return;
                         }
-                        if (event.data && event.data.action === "redirect") {
+                        if (!event.data || !event.data.url) {
+                            return;
+                        }
+                        if (event.data.action === "redirect") {
                             console.log(`收到 postMessage 跳转指令，iframe 加载: ${event.data.url}`);
-                            // 使用 iframe 加载新页面
                             showIframe(event.data.url);
+                            return;
+                        }
+                        if (event.data.action === "wechatOAuth") {
+                            let oauthUrl;
+                            try {
+                                oauthUrl = new URL(event.data.url);
+                            } catch (e) {
+                                return;
+                            }
+                            // 只放行微信网页授权，避免平台页把顶层窗口带到其它地址
+                            if (oauthUrl.protocol !== 'https:' || oauthUrl.hostname !== 'open.weixin.qq.com') {
+                                return;
+                            }
+                            console.log('顶层窗口打开微信授权:', oauthUrl.toString());
+                            location.href = oauthUrl.toString();
                         }
                     });
 
