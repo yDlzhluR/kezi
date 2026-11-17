@@ -131,7 +131,7 @@
                      * 补登录态；失效域名场景附带新分享链供平台展示。
                      *
                      * @param {string} link 落地校验返回的平台链接
-                     * @param {{fromInvalidDomain?: boolean, redirectLink?: string}} extra 附加参数
+                     * @param {{fromInvalidDomain?: boolean, redirectLink?: string, tenantId?: number|string}} extra 附加参数
                      * @returns {string} 最终跳转 URL
                      */
                     function buildPlatformJumpUrl(link, extra) {
@@ -156,12 +156,20 @@
                             }
                         });
                         url.search = '';
-                        // 2. 补登录态与失效域名提示参数
+                        // 2. 补登录态。场景、模块、目标仍走 /context，不放进地址
+                        params.delete('sceneType');
+                        params.delete('moduleCode');
+                        params.delete('targetId');
                         if (accessToken) {
                             params.set('accessToken', accessToken);
                         }
                         if (refreshToken) {
                             params.set('refreshToken', refreshToken);
+                        }
+                        // 平台启动时没有租户号会清掉刚写入的登录态。只带落地校验返回的租户号
+                        const tenantId = extra && extra.tenantId != null ? String(extra.tenantId).trim() : '';
+                        if (/^[1-9]\d*$/.test(tenantId)) {
+                            params.set('tenantId', tenantId);
                         }
                         if (extra && extra.fromInvalidDomain && extra.redirectLink) {
                             params.set('fromInvalidDomain', '1');
@@ -199,7 +207,7 @@
                                 console.log("落地风控返回:", res);
                                 // yudao CommonResult：code=0 成功
                                 if (res && res.code === 0 && res.data) {
-                                    const { pass, interceptUrl, fromInvalidDomain, redirectLink, link } = res.data;
+                                    const { pass, interceptUrl, fromInvalidDomain, redirectLink, link, tenantId } = res.data;
                                     if (pass) {
                                         if (!link) {
                                             loading.textContent = "加载失败，请稍后再试。";
@@ -209,6 +217,7 @@
                                         const target = buildPlatformJumpUrl(link, {
                                             fromInvalidDomain: !!fromInvalidDomain,
                                             redirectLink: redirectLink || '',
+                                            tenantId: tenantId,
                                         });
                                         console.log("iframe 打开平台 H5:", target);
                                         showIframe(target);
